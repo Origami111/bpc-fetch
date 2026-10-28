@@ -336,7 +336,7 @@ async def _cmd_fetch(args) -> dict:
     if not args.no_images and article["images"]:
         saved_images = await download_images(article["images"], images_dir)
 
-    md = article_to_markdown(article, images_dir="images")
+    md = article_to_markdown(article, images_dir="images", include_images=not args.no_images)
     md_path = out_dir / slug / f"{slug}.md"
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(md, encoding="utf-8")
@@ -392,7 +392,7 @@ async def _cmd_batch(args) -> dict:
                     images_dir = out_dir / slug / "images"
                     if not args.no_images and article["images"]:
                         await download_images(article["images"], images_dir, client=client)
-                    md = article_to_markdown(article, images_dir="images")
+                    md = article_to_markdown(article, images_dir="images", include_images=not args.no_images)
                     md_path = out_dir / slug / f"{slug}.md"
                     md_path.parent.mkdir(parents=True, exist_ok=True)
                     md_path.write_text(md, encoding="utf-8")

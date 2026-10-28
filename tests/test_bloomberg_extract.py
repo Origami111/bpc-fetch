@@ -108,6 +108,59 @@ class BloombergExtractionTests(unittest.TestCase):
         result = extract_article(html, URL)
         self.assertEqual(result["images"], ["https://www.bloomberg.com/hero.jpg", "https://www.bloomberg.com/body.jpg"])
 
+    def test_recommendation_heading_trims_legacy_bodies_and_images(self):
+        for component in ("ArticleBody", "FeatureBody"):
+            for heading in ("<p><strong>More From Bloomberg Opinion:</strong></p>",
+                            "<p>  more FROM Bloomberg   Opinion : </p>",
+                            "<h3>More From Bloomberg Opinion:</h3>",
+                            "<p>**More From Bloomberg Opinion:**</p>"):
+                with self.subTest(component=component, heading=heading):
+                    body = ''.join(f'<p>{p}</p>' for p in PARAGRAPHS)
+                    body += '<div>' + heading + '<p>Recommended story must disappear</p></div>'
+                    body += '<p>Later footer must disappear</p><img src="/recommended.jpg">'
+                    result = extract_article(page({"body": body}, component), URL)
+                    self.assertNotIn("extraction_error", result)
+                    self.assertIn(PARAGRAPHS[-1], result["text"])
+                    self.assertNotIn("bloomberg opinion", result["text"].lower())
+                    self.assertNotIn("must disappear", result["text"])
+                    self.assertEqual(result["images"], [])
+
+    def test_recommendation_heading_trims_current_body(self):
+        for kind, value, attributes in (("paragraph", "More From Bloomberg Opinion:", {"strong": True}),
+                                        ("paragraph", " more FROM Bloomberg   Opinion : ", {}),
+                                        ("heading", "More From Bloomberg Opinion:", {}),
+                                        ("paragraph", "**More From Bloomberg Opinion:**", {})):
+            with self.subTest(kind=kind, value=value):
+                nodes = [paragraph(p) for p in PARAGRAPHS]
+                nodes.append({"type": kind, "content": [{"type": "text", "value": value, "attributes": attributes}]})
+                nodes += [paragraph("Recommended story must disappear"),
+                          {"type": "media", "subType": "photo", "data": {"photo": {"src": "/recommended.jpg"}}}]
+                result = extract_article(next_page(nodes), URL)
+                self.assertNotIn("extraction_error", result)
+                self.assertIn(PARAGRAPHS[-1], result["text"])
+                self.assertNotIn("bloomberg opinion", result["text"].lower())
+                self.assertNotIn("must disappear", result["text"])
+                self.assertEqual(result["images"], [])
+
+    def test_recommendation_words_in_a_sentence_do_not_truncate(self):
+        sentence = 'The label "More From Bloomberg Opinion:" appears in this ordinary sentence.'
+        nodes = [paragraph(PARAGRAPHS[0]), paragraph(sentence), paragraph(PARAGRAPHS[1])]
+        legacy = ''.join(f'<p>{text}</p>' for text in (PARAGRAPHS[0], sentence, PARAGRAPHS[1]))
+        legacy = legacy.replace('More From Bloomberg Opinion:', '<strong>More From Bloomberg Opinion:</strong>')
+        for html in (next_page(nodes), page({"body": legacy}, "ArticleBody")):
+            with self.subTest(html=html):
+                text = extract_article(html, URL)["text"]
+                self.assertIn("ordinary sentence", text)
+                self.assertIn("More From Bloomberg Opinion:", text)
+                self.assertIn(PARAGRAPHS[-1], text)
+
+    def test_body_without_recommendation_heading_is_unchanged(self):
+        expected = "\n\n".join(PARAGRAPHS)
+        legacy = ''.join(f'<p>{p}</p>' for p in PARAGRAPHS)
+        for html in (next_page(), page({"body": legacy}, "ArticleBody"), page({"body": legacy}, "FeatureBody")):
+            with self.subTest(html=html):
+                self.assertEqual(extract_article(html, URL)["text"], expected)
+
     def test_malformed_json_does_not_raise_or_extract_teaser(self):
         html = '<title>Test</title><script id="__NEXT_DATA__">{broken}</script>'
         html += '<article><p>' + PARAGRAPHS[0] + '</p></article>'

@@ -1,5 +1,6 @@
 """Offline regressions for request routing, browser failures and access challenges."""
 import re
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 
 from bpc_fetch import browser, cli, sites, strategy
+from bpc_fetch.extract import article_to_markdown
 
 
 URL = "https://www.bloomberg.com/opinion/articles/example"
@@ -182,6 +184,77 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status_code"], 403)
         extract.assert_not_called()
         args.out_dir.mkdir.assert_not_called()
+
+    async def check_text_only_output(self, command):
+        article = {"title": "Synthetic text only", "url": URL,
+                   "text": ('Opening paragraph.\n\n![Inline photo](https://example.test/photo(a).jpg)\n'
+                            '<img src="https://example.test/html.jpg" alt="photo">\n'
+                            '<picture><source srcset="other.webp"><img src="other.jpg"></picture>\n'
+                            '![Reference photo][photo]\n\n[photo]: https://example.test/reference.jpg\n'
+                            '[Ordinary link](https://example.test/story)\n\nClosing paragraph.'),
+                   "images": ["https://example.test/hero.jpg", "https://example.test/other.jpg"]}
+        with tempfile.TemporaryDirectory() as directory:
+            args = SimpleNamespace(url=URL, urls=[URL], file=None, sites_js=None,
+                                   out_dir=Path(directory), no_images=True, concurrency=1)
+            with patch.object(cli, "get_sites_map", return_value={}), \
+                    patch.object(strategy, "fetch_with_retries", AsyncMock(return_value=(ARTICLE, 200, None))), \
+                    patch("bpc_fetch.extract.extract_article", return_value=article), \
+                    patch("bpc_fetch.extract.download_images", new_callable=AsyncMock) as download, \
+                    patch("bpc_fetch.history.mark_fetched"):
+                result = await command(args)
+            self.assertTrue(result["ok"])
+            item = result["results"][0] if "results" in result else result
+            self.assertTrue(item["ok"])
+            markdown = Path(item["path"]).read_text(encoding="utf-8")
+            download.assert_not_called()
+            self.assertNotIn("![", markdown)
+            self.assertNotIn("<img", markdown)
+            self.assertNotIn("<picture", markdown)
+            self.assertNotIn("images/", markdown)
+            self.assertIn("Opening paragraph.", markdown)
+            self.assertIn("Closing paragraph.", markdown)
+            self.assertIn("[Ordinary link](https://example.test/story)", markdown)
+            self.assertFalse((Path(item["path"]).parent / "images").exists())
+            self.assertEqual(article["images"], ["https://example.test/hero.jpg", "https://example.test/other.jpg"])
+
+    async def test_fetch_no_images_never_downloads_or_writes_images(self):
+        await self.check_text_only_output(cli._cmd_fetch)
+
+    async def test_batch_no_images_never_downloads_or_writes_images(self):
+        await self.check_text_only_output(cli._cmd_batch)
+
+
+class MarkdownImageTests(unittest.TestCase):
+    def test_text_only_preserves_code_ordinary_links_and_escaped_markup(self):
+        text = ('Inline `![example](code.jpg)` and ``<img src="code.jpg">``.\n\n'
+                '```markdown\n![fenced](code.jpg)\n<img src="code.jpg">\n```\n\n'
+                '~~~~html\n<img src="code.jpg">\n~~~~~\n\n'
+                '    ![indented](code.jpg)\n\n'
+                '[Ordinary link](https://example.test/story) and \\![escaped](literal.jpg).\n'
+                'Unresolved ![brackets] remain ordinary text.\n'
+                '![Rendered](real.jpg) <img alt=">" src="real.jpg">')
+        article = {"title": "Code examples", "url": URL, "text": text, "images": ["hero.jpg"]}
+        markdown = article_to_markdown(article, include_images=False)
+        self.assertIn(text[:text.index('![Rendered]')], markdown)
+        self.assertNotIn('![Rendered]', markdown)
+        self.assertNotIn('src="real.jpg"', markdown)
+        self.assertNotIn('images/', markdown)
+
+    def test_text_only_removes_all_reference_image_forms(self):
+        article = {"title": "Reference images", "url": URL, "images": [],
+                   "text": ("![Full][photo] ![photo][] ![photo]\n\n"
+                            "[photo]: https://example.test/photo.jpg\n"
+                            "[Ordinary reference][photo]")}
+        markdown = article_to_markdown(article, include_images=False)
+        self.assertNotIn("![", markdown)
+        self.assertIn("[Ordinary reference][photo]", markdown)
+
+    def test_images_remain_enabled_by_default(self):
+        article = {"title": "Images enabled", "url": URL,
+                   "text": "![Inline](inline.jpg)", "images": ["https://example.test/hero.jpg"]}
+        markdown = article_to_markdown(article)
+        self.assertIn("![image](images/", markdown)
+        self.assertIn("![Inline](inline.jpg)", markdown)
 
 
 class BrowserTests(unittest.IsolatedAsyncioTestCase):

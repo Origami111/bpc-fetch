@@ -15,6 +15,12 @@ This fork maintains fixes for standalone article collection with bpc-fetch. It d
 
 Known article data is extracted before generic DOM text: legacy ArticleBody/FeatureBody JSON and current `__NEXT_DATA__.props.pageProps.story.body.content`. Metadata, paragraphs, headings, lists, quotes and images are retained. Missing, malformed or incomplete bodies fail conservatively; extremely short articles may require further tuning.
 
+The standalone `More From Bloomberg Opinion:` recommendation heading and everything following it are excluded from Bloomberg bodies, including recommendation images. An ordinary sentence mentioning that label does not end the article.
+
+#### Text-only output
+
+`fetch --no-images` and `batch --no-images` skip downloads and omit image embeds from saved Markdown, including Markdown/HTML images already present in extracted text. Ordinary links and literal image examples inside code remain intact.
+
 #### Validation
 
 On 2026-10-28, a standalone headed fetch of the requested Bloomberg opinion URL completed with 5,063 text characters and one downloaded image. Headless requests received an HTTP 403 robot page in the same environment. This is evidence for that article and environment, not a guarantee for every site or future request.

@@ -237,6 +237,22 @@ def _bloomberg_body(body_html: str, url: str) -> tuple[str, list[str], int]:
     body = BeautifulSoup(body_html, "html.parser")
     for unwanted in body.select('script, style, nav, aside, footer, form, button, [class*="teaser"], [class*="newsletter"], [class*="recirc"], [id*="paywall"], [class*="paywall"]'):
         unwanted.decompose()
+    # This publisher's recommendation heading ends the article. Trim the DOM
+    # first so recommendation paragraphs and images cannot count as body content.
+    for block in body.find_all(["p", "div", "section", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        heading = block.get_text(" ", strip=True).strip()
+        heading = re.sub(r"^#{1,6}\s+", "", heading)
+        if heading.startswith("**") and heading.endswith("**"):
+            heading = heading[2:-2].strip()
+        if not re.fullmatch(r"more\s+from\s+bloomberg\s+opinion\s*:", heading, re.I):
+            continue
+        current = block
+        while current is not body:
+            for sibling in list(current.next_siblings):
+                sibling.extract()
+            current = current.parent
+        block.decompose()
+        break
     for link in body.find_all("a", href=True):
         href = _bloomberg_url(link["href"], url)
         if href:
@@ -265,7 +281,7 @@ def _bloomberg_body(body_html: str, url: str) -> tuple[str, list[str], int]:
     return text, images, prose_count
 
 
-def article_to_markdown(article: dict, images_dir: str = "images") -> str:
+def article_to_markdown(article: dict, images_dir: str = "images", include_images: bool = True) -> str:
     """Convert extracted article to markdown with frontmatter."""
     lines = []
     lines.append("---")
@@ -277,10 +293,12 @@ def article_to_markdown(article: dict, images_dir: str = "images") -> str:
     lines.append(f"source: {article['url']}")
     lines.append("---")
     lines.append("")
-    lines.append(f"# {article['title']}")
+    lines.append(f"### {article['title']}")
     lines.append("")
 
     text = article["text"]
+    if not include_images:
+        text = _strip_image_markup(text)
 
     # Strip paywall markers from text
     for marker in ["Enjoying our latest content?", "Log in or create an account to continue",
@@ -290,7 +308,7 @@ def article_to_markdown(article: dict, images_dir: str = "images") -> str:
             text = text[:idx].rstrip()
 
     # Embed first image as hero, rest at end
-    if article.get("images"):
+    if include_images and article.get("images"):
         fname = _image_filename(article["images"][0], 0)
         lines.append(f"![image]({images_dir}/{fname})")
         lines.append("")
@@ -298,7 +316,7 @@ def article_to_markdown(article: dict, images_dir: str = "images") -> str:
     lines.append(text)
 
     # Remaining images at end
-    if article.get("images") and len(article["images"]) > 1:
+    if include_images and article.get("images") and len(article["images"]) > 1:
         lines.append("")
         for i, img_url in enumerate(article["images"][1:], 1):
             fname = _image_filename(img_url, i)
@@ -306,6 +324,82 @@ def article_to_markdown(article: dict, images_dir: str = "images") -> str:
             lines.append("")
 
     return "\n".join(lines)
+
+
+def _strip_image_markup(text: str) -> str:
+    """Remove rendered Markdown/HTML images while preserving links and code."""
+    def reference_id(label: str) -> str:
+        return " ".join(label.split()).casefold()
+
+    references = {reference_id(label) for label in re.findall(r"(?m)^ {0,3}\[([^\]\n]+)\]:[ \t]*\S+", text)}
+
+    def without_images(prose: str) -> str:
+        # Code spans are literal article content, including examples of images.
+        spans = re.split(r"(`+)(.*?)(\1)", prose, flags=re.S)
+        for index in range(0, len(spans), 4):
+            value = re.sub(r"<picture\b[^>]*>.*?</picture\s*>", "", spans[index], flags=re.I | re.S)
+            value = re.sub(r'''<img\b(?:[^>"']|"[^"]*"|'[^']*')*>''', "", value, flags=re.I)
+            # Match balanced labels/destinations instead of consuming ordinary
+            # links or stopping at a parenthesis inside an image URL.
+            result = []
+            pos = 0
+            while pos < len(value):
+                if value[pos:pos + 2] == "![" and (pos == 0 or value[pos - 1] != "\\"):
+                    end = balanced_end(value, pos + 1, "[", "]")
+                    if end is not None:
+                        after = end
+                        label = value[pos + 2:end - 1]
+                        image = reference_id(label) in references
+                        if after < len(value) and value[after] in "([":
+                            opening = value[after]
+                            destination = balanced_end(value, after, opening, ")" if opening == "(" else "]")
+                            if destination is not None:
+                                target = value[after + 1:destination - 1] or label
+                                image = opening == "(" or reference_id(target) in references
+                                end = destination
+                        if image:
+                            pos = end
+                            continue
+                result.append(value[pos])
+                pos += 1
+            spans[index] = "".join(result)
+        return "".join(spans)
+
+    def balanced_end(value: str, start: int, opening: str, closing: str) -> int | None:
+        depth = 0
+        pos = start
+        while pos < len(value):
+            if value[pos] == "\\":
+                pos += 2
+                continue
+            if value[pos] == opening:
+                depth += 1
+            elif value[pos] == closing:
+                depth -= 1
+                if depth == 0:
+                    return pos + 1
+            pos += 1
+        return None
+
+    output, prose = [], []
+    fence = None
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        indented = line.startswith(("    ", "\t"))
+        if fence or marker or indented:
+            if prose:
+                output.append(without_images("".join(prose)))
+                prose.clear()
+            output.append(line)
+            if fence:
+                if re.fullmatch(r" {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*\n?", line):
+                    fence = None
+            elif marker:
+                fence = marker[1]
+        else:
+            prose.append(line)
+    output.append(without_images("".join(prose)))
+    return "".join(output)
 
 
 async def download_images(
