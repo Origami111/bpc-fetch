@@ -2,23 +2,19 @@
 import asyncio
 import re
 from contextlib import asynccontextmanager
-from pathlib import Path
-
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, Page
 
 from .sites import SiteStrategy
 
 BROWSER_TIMEOUT = 30000
 
 
+class BrowserLaunchError(RuntimeError):
+    """Browser setup failed and requires operator attention."""
+
+
 async def ensure_browser() -> dict:
-    """Check if Playwright Chromium is installed. Returns status dict."""
-    try:
-        from playwright._impl._driver import compute_driver_executable
-        driver = compute_driver_executable()
-        return {"ok": True, "driver": str(driver)}
-    except Exception:
-        pass
+    """Verify that the Chromium executable can actually launch."""
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -32,15 +28,24 @@ async def ensure_browser() -> dict:
 class BrowserPool:
     """Reusable browser context pool for batch operations."""
 
-    def __init__(self, max_contexts: int = 3):
+    def __init__(self, max_contexts: int = 3, headless: bool = True):
         self._pw = None
         self._browser: Browser | None = None
         self._max = max_contexts
         self._sem = asyncio.Semaphore(max_contexts)
+        self._headless = headless
 
     async def start(self):
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=True)
+        try:
+            self._pw = await async_playwright().start()
+            self._browser = await self._pw.chromium.launch(headless=self._headless)
+        except Exception as exc:
+            if self._pw:
+                await self._pw.stop()
+                self._pw = None
+            raise BrowserLaunchError(
+                f"Chromium could not launch: {exc}. Run: playwright install chromium"
+            ) from exc
 
     async def stop(self):
         if self._browser:
@@ -51,9 +56,8 @@ class BrowserPool:
     @asynccontextmanager
     async def page(self):
         async with self._sem:
-            ctx = await self._browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-            )
+            # Keep the user agent consistent with the installed browser engine.
+            ctx = await self._browser.new_context()
             pg = await ctx.new_page()
             try:
                 yield pg
@@ -69,37 +73,11 @@ class BrowserPool:
         await self.stop()
 
 
-def _build_route_patterns(strategy: SiteStrategy) -> list[str]:
-    """Convert BPC block_regex to Playwright route glob patterns."""
+def _build_route_patterns(strategy: SiteStrategy) -> list[re.Pattern]:
+    """Keep BPC regular expressions intact for Playwright's regex routing."""
     if not strategy.block_regex:
         return []
-    regex_str = strategy.block_regex
-    patterns = []
-    for part in re.split(r'\|', regex_str):
-        part = part.strip().strip("()")
-        glob = _regex_to_glob(part)
-        if glob:
-            patterns.append(glob)
-    if not patterns:
-        patterns.append(f"**/*{strategy.domain}*paywall*")
-    return patterns
-
-
-def _regex_to_glob(regex_part: str) -> str:
-    """Best-effort convert a simple regex fragment to a glob pattern."""
-    s = regex_part.replace("\\.", ".").replace("\\/", "/")
-    s = re.sub(r'\.\+', '*', s)
-    s = re.sub(r'\.\*', '*', s)
-    s = re.sub(r'\([^)]*\)', '*', s)
-    s = re.sub(r'\[[^\]]*\]', '?', s)
-    s = re.sub(r'[\\^$]', '', s)
-    if not s or s == '*':
-        return ""
-    if not s.startswith("*"):
-        s = "**/" + s
-    if not s.endswith("*"):
-        s = s + "*"
-    return s
+    return [re.compile(strategy.block_regex)]
 
 
 async def fetch_with_browser(
@@ -108,9 +86,20 @@ async def fetch_with_browser(
     pool: BrowserPool | None = None,
 ) -> tuple[str, int]:
     """Fetch page using Playwright, blocking paywall scripts via route."""
+    html, status, _ = await fetch_with_browser_result(url, strategy, pool)
+    return html, status
+
+
+async def fetch_with_browser_result(
+    url: str,
+    strategy: SiteStrategy,
+    pool: BrowserPool | None = None,
+    headless: bool = True,
+) -> tuple[str, int, dict | None]:
+    """Shared navigation and DOM extraction for single, batch and crawl fetches."""
     own_pool = pool is None
     if own_pool:
-        pool = BrowserPool(max_contexts=1)
+        pool = BrowserPool(max_contexts=1, headless=headless)
         await pool.start()
 
     try:
@@ -121,23 +110,17 @@ async def fetch_with_browser(
 
             route_patterns = _build_route_patterns(strategy)
             for pattern in route_patterns:
-                try:
-                    await page.route(pattern, lambda route: route.abort())
-                except Exception:
-                    pass
+                await page.route(pattern, lambda route: route.abort())
 
-            # Block common paywall providers
-            for provider in ["piano.io", "tinypass.com", "poool.fr", "zephr.com", "pelcro.com", "sophi.io"]:
-                try:
-                    await page.route(f"**/*{provider}*", lambda route: route.abort())
-                except Exception:
-                    pass
+            # A site-specific BPC rule takes precedence over generic providers.
+            providers = [] if strategy.block_regex else ["piano.io", "tinypass.com", "poool.fr", "zephr.com", "pelcro.com", "sophi.io"]
+            for provider in providers:
+                await page.route(f"**/*{provider}*", lambda route: route.abort())
 
-            try:
-                resp = await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
-                status = resp.status if resp else 0
-            except Exception:
-                status = 0
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=BROWSER_TIMEOUT)
+            status = resp.status if resp else 0
+            if status != 200:
+                return await page.content(), status, None
 
             # Wait for article content to render
             try:
@@ -165,7 +148,8 @@ async def fetch_with_browser(
 
             await page.wait_for_timeout(500)
             html = await page.content()
-            return html, status if status else 200
+            dom_result = await extract_article_dom(page)
+            return html, status, dom_result
     finally:
         if own_pool:
             await pool.stop()

@@ -7,12 +7,15 @@ from dataclasses import dataclass, field, asdict
 
 
 def _default_sites_js() -> Path:
-    """Locate sites.js: PyInstaller bundle → package data → home fallback."""
+    """Locate sites.js: PyInstaller bundle → package data → repo → home."""
     if getattr(sys, '_MEIPASS', None):
         return Path(sys._MEIPASS) / "data" / "sites.js"
-    pkg_data = Path(__file__).parent.parent.parent / "data" / "sites.js"
+    pkg_data = Path(__file__).resolve().parent / "data" / "sites.js"
     if pkg_data.exists():
         return pkg_data
+    repo_data = Path(__file__).resolve().parents[2] / "data" / "sites.js"
+    if repo_data.exists():
+        return repo_data
     return Path.home() / "code/clis/bpc-fetch/data/sites.js"
 
 
@@ -39,10 +42,10 @@ class SiteStrategy:
             return f"ua:{self.useragent}"
         if self.referer:
             return f"referer:{self.referer}"
-        if self.cs_dompurify:
-            return "archive"
         if self.block_regex:
             return "block_js"
+        if self.cs_dompurify:
+            return "archive"
         return "cookies"
 
     def to_dict(self) -> dict:

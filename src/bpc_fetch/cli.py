@@ -40,6 +40,7 @@ def main():
     p_fetch.add_argument("--out-dir", type=Path, default=Path("."))
     p_fetch.add_argument("--no-images", action="store_true")
     p_fetch.add_argument("--incremental", action="store_true", help="Skip if already fetched")
+    p_fetch.add_argument("--headed", action="store_true", help="Use a visible standalone Chromium for browser fallback")
 
     # batch
     p_batch = sub.add_parser("batch", help="Batch fetch multiple URLs", parents=[_common])
@@ -89,6 +90,8 @@ def main():
         sys.exit(130)
     except Exception as e:
         err = {"ok": False, "error": str(e), "recovery_command": "bpc-fetch doctor --compact"}
+        if hasattr(e, "status_code"):
+            err["status_code"] = e.status_code
         print(json.dumps(err))
         sys.exit(1)
 
@@ -129,7 +132,7 @@ def _enrich_result(result: dict, args) -> dict:
 
 async def _dispatch(args) -> dict:
     if args.command == "doctor":
-        return _cmd_doctor(args)
+        return await _cmd_doctor(args)
     if args.command == "sites":
         return _cmd_sites(args)
     if args.command == "search":
@@ -149,7 +152,7 @@ async def _dispatch(args) -> dict:
     return {"ok": False, "error": f"unknown command: {args.command}"}
 
 
-def _cmd_doctor(args) -> dict:
+async def _cmd_doctor(args) -> dict:
     issues = []
     js_path = args.sites_js or SITES_JS_DEFAULT
     site_count = 0
@@ -180,20 +183,20 @@ def _cmd_doctor(args) -> dict:
         pw_ok = True
         import importlib.metadata
         pw_info = importlib.metadata.version("playwright")
-    except (ImportError, Exception):
-        issues.append("playwright not installed (run: pip install playwright)")
+    except Exception as exc:
+        issues.append(f"playwright unavailable: {exc} (run: pip install playwright)")
 
     chromium_ok = False
+    browser_info = {}
     if pw_ok:
         try:
-            import subprocess
-            r = subprocess.run(
-                [sys.executable, "-m", "playwright", "install", "--dry-run", "chromium"],
-                capture_output=True, text=True, timeout=10
-            )
-            chromium_ok = "is already installed" in r.stdout or r.returncode == 0
-        except Exception:
-            chromium_ok = False
+            from .browser import ensure_browser
+            browser_info = await ensure_browser()
+            chromium_ok = browser_info["ok"]
+        except Exception as exc:
+            browser_info = {"ok": False, "error": str(exc)}
+        if not chromium_ok:
+            issues.append(f"Chromium could not launch: {browser_info.get('error', 'unknown error')}")
 
     return {
         "ok": len(issues) == 0,
@@ -205,6 +208,7 @@ def _cmd_doctor(args) -> dict:
         "playwright": pw_ok,
         "playwright_version": pw_info,
         "chromium_installed": chromium_ok,
+        "browser": browser_info,
         "issues": issues,
     }
 
@@ -298,7 +302,7 @@ async def _cmd_search(args) -> dict:
 
 async def _cmd_fetch(args) -> dict:
     from .extract import extract_article, article_to_markdown, download_images
-    from .strategy import fetch_with_retries
+    from .strategy import FetchError, fetch_with_retries
     from .history import is_fetched, mark_fetched
 
     js_path = args.sites_js or SITES_JS_DEFAULT
@@ -309,9 +313,15 @@ async def _cmd_fetch(args) -> dict:
     if getattr(args, 'incremental', False) and is_fetched(args.url):
         return {"ok": True, "skipped": True, "reason": "already_fetched", "url": args.url, "domain": domain}
 
-    html, status, dom_result = await fetch_with_retries(args.url, strategy)
+    try:
+        headed = getattr(args, "headed", False)
+        html, status, dom_result = await fetch_with_retries(
+            args.url, strategy, use_browser=True if headed else None, headless=not headed,
+        )
+    except FetchError as exc:
+        return {"ok": False, "error": str(exc), "status_code": exc.status_code, "url": args.url, "domain": domain}
     if status != 200:
-        return {"ok": False, "error": f"HTTP {status}", "url": args.url, "domain": domain}
+        return {"ok": False, "error": f"HTTP {status}", "status_code": status, "url": args.url, "domain": domain}
 
     article = extract_article(html, args.url, dom_result=dom_result)
     if not article["text"]:
@@ -374,7 +384,7 @@ async def _cmd_batch(args) -> dict:
                 try:
                     html, status, dom_result = await fetch_with_retries(url, strategy, client)
                     if status != 200:
-                        return {"ok": False, "url": url, "error": f"HTTP {status}"}
+                        return {"ok": False, "url": url, "error": f"HTTP {status}", "status_code": status}
                     article = extract_article(html, url, dom_result=dom_result)
                     if not article["text"]:
                         return {"ok": False, "url": url, "error": "extraction_failed"}
@@ -388,7 +398,10 @@ async def _cmd_batch(args) -> dict:
                     md_path.write_text(md, encoding="utf-8")
                     return {"ok": True, "url": url, "title": article["title"], "path": str(md_path)}
                 except Exception as e:
-                    return {"ok": False, "url": url, "error": str(e)}
+                    result = {"ok": False, "url": url, "error": str(e)}
+                    if hasattr(e, "status_code"):
+                        result["status_code"] = e.status_code
+                    return result
 
         tasks = [_fetch_one(u) for u in urls]
         results = await aio.gather(*tasks)
